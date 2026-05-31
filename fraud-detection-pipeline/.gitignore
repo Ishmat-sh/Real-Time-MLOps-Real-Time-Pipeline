@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+*.pkl
+*.parquet
+!data/baseline/.gitkeep
+inference/models/*
+!inference/models/.gitkeep
+feast/feature_repo/data/
+*.egg-info/
+.DS_Store
+drift_reports/

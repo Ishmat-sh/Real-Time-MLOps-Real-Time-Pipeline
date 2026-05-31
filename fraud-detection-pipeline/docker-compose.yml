@@ -1,0 +1,157 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.4
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --set redpanda.auto_create_topics_enabled=true
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  feast-init:
+    build:
+      context: .
+      dockerfile: feast/Dockerfile
+    volumes:
+      - feast-data:/app/feature_repo/data
+      - ./feast/feature_repo:/app/feature_repo
+    environment:
+      FEAST_USAGE: "False"
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["python", "/app/scripts/setup_feast.py"]
+
+  train:
+    build:
+      context: .
+      dockerfile: training/Dockerfile
+    volumes:
+      - ./inference/models:/app/output/models
+      - ./data:/app/data
+      - feast-data:/app/feast_data
+    depends_on:
+      feast-init:
+        condition: service_completed_successfully
+
+  inference:
+    build:
+      context: .
+      dockerfile: inference/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /app/models/fraud_model.pkl
+      FEATURE_REPO_PATH: /app/feature_repo
+      FEAST_USAGE: "False"
+      REDIS_HOST: redis
+      FRAUD_THRESHOLD: "0.5"
+    volumes:
+      - ./inference/models:/app/models
+      - ./feast/feature_repo:/app/feature_repo
+      - feast-data:/app/feature_repo/data
+      - drift-samples:/app/drift_samples
+    depends_on:
+      train:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      KAFKA_TOPIC: raw-transactions
+      TRANSACTIONS_PER_SECOND: "50"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  consumer:
+    build:
+      context: .
+      dockerfile: consumer/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      KAFKA_TOPIC: raw-transactions
+      KAFKA_GROUP: fraud-scoring-consumer
+      INFERENCE_URL: http://inference:8000/predict
+      DRIFT_SAMPLE_DIR: /app/drift_samples
+    volumes:
+      - drift-samples:/app/drift_samples
+    depends_on:
+      inference:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - inference
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+  drift-monitor:
+    build:
+      context: .
+      dockerfile: monitoring/drift/Dockerfile
+    environment:
+      BASELINE_PATH: /app/data/baseline/training_features.parquet
+      SAMPLE_DIR: /app/drift_samples
+      CHECK_INTERVAL_SECONDS: "120"
+      DRIFT_THRESHOLD: "0.25"
+    volumes:
+      - ./data:/app/data:ro
+      - drift-samples:/app/drift_samples
+    depends_on:
+      train:
+        condition: service_completed_successfully
+
+volumes:
+  feast-data:
+  drift-samples:

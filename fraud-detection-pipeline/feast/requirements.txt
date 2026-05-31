@@ -1,0 +1,4 @@
+feast[redis]==0.38.0
+pandas==2.2.3
+numpy==2.1.2
+pyarrow==17.0.0
